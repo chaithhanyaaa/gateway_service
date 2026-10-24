@@ -14,8 +14,9 @@ class Settings(BaseSettings):
     JWT_SECRET: str
     JWT_ISSUER: str
     JWT_AUDIENCE: str
-
     JWT_ALGORITHM: str
+    GROQ_FAILURE_THRESHOLD:int
+    GROQ_RECOVERY_TIMEOUT:float
 
     #ACCESS_TOKEN_EXPIRE_MINUTES: int
 

@@ -25,6 +25,7 @@ app.include_router(gateway_router)
 
 if __name__ == "__main__":
     port = int(Settings().PORT)
+    print(port)
 
     uvicorn.run(
         app,
