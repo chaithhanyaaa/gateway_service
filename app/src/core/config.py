@@ -3,16 +3,19 @@ class Settings(BaseSettings):
 
     #DATABASE_URL: str
 
-    #REDIS_PORT:int
+    PORT:int
+    HOST:str
 
     #REDIS_HOST:str
 
 
     grokAPIKey:str
 
-    #JWT_SECRET: str
+    JWT_SECRET: str
+    JWT_ISSUER: str
+    JWT_AUDIENCE: str
 
-    #JWT_ALGORITHM: str
+    JWT_ALGORITHM: str
 
     #ACCESS_TOKEN_EXPIRE_MINUTES: int
 

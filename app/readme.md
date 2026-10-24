@@ -1,0 +1,7 @@
+- retries : okay to retry before the first chunk we receive ,because immediatly the router recives the chumk it sends to the user if we retry after the first chumk we may get duplicate chunks
+- we do retry max 3 times that too if in the first attempt if it failes after the first chunk we just terminates the loop and rise the exeption it will catched by the router and sends the error to the client
+- backof retries ,instead of retring immediatly which actually increses the load to the server ,we retry after some gap .we have that function in the util file that actaully calculates the delay.
+- in production multiple users sends rqst simuktaneously we need some thing to identify the http ,we can use middleware assign the rqst id ,later we can even add validation through token ,user send the token ,we validate and extract the user id .
+- issue is if we use onlu user id and user sends three rqsts all 3 http shows the same id ,we need to differentiate each rqst ,so we use both userid,rqst id.
+- we create a context to store the rqst id when it reaches
+- for validation backen service sends jwt it has userid,expiry,who generated it ,to whome it is .

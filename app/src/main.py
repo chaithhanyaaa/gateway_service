@@ -1,20 +1,34 @@
-from app.src.llms.registry import get_llm_registry
-import asyncio
+import os
+from app.src.core.config import Settings
+
+import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI
-from app.src.routers.chatRouter import router as chat_router 
+
+from app.src.core.logging_config import setup_logging
+from app.src.core.request_id_middleware import RequestIdMiddleware
+from app.src.routers.chatRouter import router as gateway_router
+
+load_dotenv()
+
+# Initialize logging before serving requests.
+setup_logging()
+
+app = FastAPI(title="LLM Gateway")
+
+# Register middleware.
+app.add_middleware(RequestIdMiddleware)
+
+# Register routes.
+app.include_router(gateway_router)
 
 
-app=FastAPI()
-app.include_router(chat_router)
-async def main():
-    llm = get_llm_registry().get_provider("groq")
-    response=await llm.generate(prompt="Hello, how are you ?",messages=[],model="openai/gpt-oss-20b")
-    print(response)
-    
+if __name__ == "__main__":
+    port = int(Settings().PORT)
 
-    
-    
-    
-
-
-
+    uvicorn.run(
+        app,
+        host=Settings().HOST,
+        port=port,
+        log_config=None,
+    )
