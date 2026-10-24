@@ -1,0 +1,10 @@
+fastapi 
+uvicorn 
+openai 
+google-genai 
+python-dotenv
+langchain
+langchain-core
+langchain-groq
+asyncio
+pydantic-settings

@@ -1,0 +1,36 @@
+### Python Core & Byte-code ###
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+### Virtual Environments ###
+.venv/
+venv/
+env/
+ENV/
+__pypackages__/
+
+### FastAPI / App Configurations & Secrets ###
+.env
+.env.*
+!.env.example
+local_settings.py
+*.log
+*.db
+*.sqlite3
+
+### Testing & Coverage ###
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.pyre/
+
+### IDEs & System Files ###
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
