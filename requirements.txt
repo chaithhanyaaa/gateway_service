@@ -10,3 +10,4 @@ asyncio
 pydantic-settings
 python-json-logger
 PyJWT
+redis

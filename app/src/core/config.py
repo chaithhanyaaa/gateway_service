@@ -5,12 +5,12 @@ class Settings(BaseSettings):
 
     PORT:int
     HOST:str
-
-    #REDIS_HOST:str
+    REDIS_HOST: str = "127.0.0.1"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
 
 
     grokAPIKey:str
-
     JWT_SECRET: str
     JWT_ISSUER: str
     JWT_AUDIENCE: str

@@ -47,9 +47,20 @@ async def get_current_user(
         )
 
         user_id = payload["sub"]
+        logger.info(f"Authenticated user: {user_id} with request ID: {request_id}")
 
         if not isinstance(user_id, str) or not user_id.strip():
             raise jwt.InvalidTokenError("Invalid subject")
+    except jwt.ExpiredSignatureError:
+      logger.warning("Authentication failed: expired bearer token")
+      raise HTTPException(
+          status_code=401,
+          detail={
+              "message": "Bearer token expired",
+              "request_id": request_id,
+          },
+          headers={"WWW-Authenticate": "Bearer"},
+      )
 
     except jwt.InvalidTokenError:
         logger.warning("Authentication failed: invalid bearer token")

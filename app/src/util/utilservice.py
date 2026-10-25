@@ -1,6 +1,7 @@
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-import random
+import random,json,hashlib
+from app.src.DTO.UserMessage import UserMessage
 
 
 def calculate_backoff(attempt: int,base_delay: float = 1.0,max_delay: float = 10.0,) -> float:
@@ -58,3 +59,24 @@ def get_safe_error_message(exc: Exception) -> tuple[int, str]:
             return 400, "The AI provider rejected the request."
 
     return 502, "The AI request failed unexpectedly. Please try again."
+
+
+
+def create_fingerprint(user_message: UserMessage, user_id: str) -> str:
+    payload = {
+        "user_id": user_id,
+        "prompt": user_message.prompt,
+        "messages": user_message.messages,
+        "provider": user_message.provider,
+        "model": user_message.model,
+    }
+
+    canonical_payload = json.dumps(
+        payload,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+
+    return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+

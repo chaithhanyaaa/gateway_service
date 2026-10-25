@@ -22,3 +22,34 @@ The breaker opens.
 New requests to Groq are rejected quickly without making an upstream call.
 After a cooldown, the breaker allows a limited recovery probe.
 If Groq recovers, the breaker closes; otherwise, it opens again.
+
+### IDEMPOTENCY
+- we have client , backend , gateway , llm
+- gateway has also connection with redis ,redis has status,operation key,chunks .
+- client starts with sending rqst it has opeartion key ,backend forwords that to the gateway and gateway asks the llm service ,now gateway before sending to the backend it updates the redis for every chunk ,after the stream it updates the status to "done",if llm service is down while streaming , gateway waits untill the time is out and after that it updates the status failed,now user side time will be out and he tries again,now gateway checks if it is failed so refetches from the llm.
+- if connection between the backend client is failed same client asks with same key ,backend asks gateway it asks redis if it seens done,sends that .
+-what if streaming is being done from gateway to backend ,now user retried due to conection lost between backend and client he lost response so he retries ,now backend again asks gateway and gate sees the redis it decides if that to ask llm or redis is enough send all chunks from the first chunk
+
+- so the redis store key=operationid, value=[fingerprints(shahash of prompt,model,operation key),messages,prompt,status]
+
+```
+Situation	                                                          Server action
+Same user + same operation ID + same fingerprint + RUNNING	        Attach to the existing stream
+Same user + same operation ID + same fingerprint + DONE	            Replay stored chunks
+Same user + same operation ID + different fingerprint	              Return 409 Conflict
+```
+
+### handling race condition 
+- imagine user clicked the send button twice accedentally ,due context switching they both see no key in redis ,so both goes to the llm.
+```
+if not await redis_client.exists(key):
+    await redis_client.hset(key, mapping=data)
+```
+- here this is not attomic so we use lua script to make it attomic ,we added that in the  app/src/service/operation_store.py
+
+- here we will have 2 pairs ,one for metadata ,other for chunks
+```
+userid:operationid:chunks - actuall chunks
+userid:operationid -{status,chunkcount,fingerprints,status}
+```
+- we have create fingerprint function in util service ,we use this in chatrouter 
