@@ -1,40 +1,52 @@
-
 import asyncio
 import json
 import logging
 import time
 
 from fastapi import APIRouter, Depends
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.src.DTO.UserMessage import UserMessage
-from app.src.llms.registry import get_llm_registry
-from app.src.service.llmservice import llmservice
-from app.src.util.utilservice import (
-    parse_messages,
-    get_safe_error_message,
-    create_fingerprint,
-)
 from app.src.core.auth import get_current_user
 from app.src.core.redis_client import redis_client
+from app.src.llms.registry import get_llm_registry
+from app.src.service.llmservice import llmservice
 from app.src.service.operation_store import (
+    append_chunks,
     claim_operation,
-    append_chunk,
     complete_operation,
     fail_operation,
     retry_failed_operation,
+)
+from app.src.util.utilservice import (
+    create_fingerprint,
+    get_safe_error_message,
+    parse_messages,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# Number of stored chunks combined into one replay SSE event.
+REPLAY_BATCH_SIZE = 20
+
+# Maximum number of Redis list entries fetched per polling iteration.
+POLL_BATCH_SIZE = 100
+
+# Delay between polling iterations for an existing operation.
+POLL_INTERVAL_SECONDS = 0.25
+
+# Number of non-empty text chunks persisted per Redis batch.
+REDIS_WRITE_BATCH_SIZE = 20
+
 
 def encode_sse(data: dict) -> str:
+    """Encode one application-level Server-Sent Event."""
     return f"data: {json.dumps(data)}\n\n"
 
 
 def get_chunk_text(raw_chunk) -> str:
-    """Extract text from a LangChain chunk or a plain string."""
+    """Extract text from a LangChain chunk or plain string."""
     if isinstance(raw_chunk, str):
         return raw_chunk
 
@@ -49,6 +61,47 @@ def get_chunk_text(raw_chunk) -> str:
     return str(raw_chunk)
 
 
+def replay_batches(chunks: list[str]):
+    """Combine stored text chunks into larger replay SSE events."""
+    for start in range(0, len(chunks), REPLAY_BATCH_SIZE):
+        batch = chunks[start:start + REPLAY_BATCH_SIZE]
+        combined_text = "".join(batch)
+
+        if combined_text:
+            yield encode_sse({"text": combined_text})
+
+
+async def persist_failure(
+    operation_id: str,
+    user_id: str,
+    exc: Exception,
+) -> None:
+    """Persist a safe error description without exposing secrets."""
+    _, safe_message = get_safe_error_message(exc)
+
+    await fail_operation(
+        operation_id=operation_id,
+        user_id=user_id,
+        error=safe_message,
+    )
+
+
+def error_response(
+    status_code: int,
+    code: str,
+    message: str,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        },
+    )
+
+
 @router.post("/chat")
 async def create_item(
     userMessage: UserMessage,
@@ -56,30 +109,84 @@ async def create_item(
 ):
     request_start = time.perf_counter()
     operation_id = userMessage.operation_id
+
+    # ---------------------------------------------------------
+    # 1. Validate the idempotency key.
+    # ---------------------------------------------------------
+    if not operation_id:
+        return error_response(
+            422,
+            "OPERATION_ID_REQUIRED",
+            "Provide a unique operation_id.",
+        )
+
     logger.info(
-        "Received chat request | operation_id=%s | user_id=%s | provider=%s | model=%s",
+        "Chat request received | operation_id=%s | "
+        "provider=%s | model=%s",
         operation_id,
-        user_id,
         userMessage.provider,
-        userMessage.model
+        userMessage.model,
     )
 
-    messages = parse_messages(userMessage.messages)
+    # ---------------------------------------------------------
+    # 2. Parse the incoming messages.
+    # ---------------------------------------------------------
+    parsing_start = time.perf_counter()
+
+    try:
+        messages = parse_messages(userMessage.messages)
+
+    except Exception as exc:
+        status_code, message = get_safe_error_message(exc)
+
+        logger.warning(
+            "Message parsing failed | operation_id=%s | "
+            "error_type=%s",
+            operation_id,
+            type(exc).__name__,
+        )
+
+        return error_response(
+            status_code,
+            "INVALID_MESSAGES",
+            message,
+        )
+
+    logger.info(
+        "Messages parsed | operation_id=%s | duration=%.4fs",
+        operation_id,
+        time.perf_counter() - parsing_start,
+    )
+
     fingerprint = create_fingerprint(userMessage, user_id)
 
-    # Step 1: Check whether Redis is available.
+    # ---------------------------------------------------------
+    # 3. Check Redis availability.
+    #
+    # If Redis is unavailable, continue generation without
+    # idempotency persistence. Do not fail the LLM request
+    # solely because Redis is down.
+    # ---------------------------------------------------------
     redis_available = False
 
     try:
         await redis_client.ping()
         redis_available = True
+
     except Exception:
         logger.exception(
-            "Redis unavailable; continuing without operation persistence"
+            "Redis unavailable; proceeding without "
+            "operation persistence | operation_id=%s",
+            operation_id,
         )
 
-    # Step 2: Claim the operation or inspect an existing operation.
+    # ---------------------------------------------------------
+    # 4. Claim the operation or handle an existing operation.
+    # ---------------------------------------------------------
     if redis_available:
+        operation_key = f"operation:{user_id}:{operation_id}"
+        chunks_key = f"{operation_key}:chunks"
+
         try:
             claimed = await claim_operation(
                 operation_id=operation_id,
@@ -87,341 +194,484 @@ async def create_item(
                 fingerprint=fingerprint,
             )
 
-            operation_key = f"operation:{user_id}:{operation_id}"
             logger.info(
-                "Operation claim attempt | operation_id=%s | user_id=%s | claimed=%s",
+                "Operation claim | operation_id=%s | claimed=%s",
                 operation_id,
-                user_id,
                 claimed,
             )
 
             if not claimed:
                 existing = await redis_client.hgetall(operation_key)
 
-                # The key may have expired or been removed between calls.
                 if not existing:
-                    logger.info(
-                        "Operation state missing | operation_id=%s | user_id=%s",
-                        operation_id,
-                        user_id,
-                    )
-                    return JSONResponse(
-                        status_code=409,
-                        content={
-                            "error": {
-                                "code": "OPERATION_STATE_MISSING",
-                                "message": (
-                                    "The operation record is missing. "
-                                    "Use a new operation ID to start a new request."
-                                ),
-                            }
-                        },
+                    return error_response(
+                        409,
+                        "OPERATION_STATE_MISSING",
+                        "The operation record disappeared. "
+                        "Use a new operation ID.",
                     )
 
-                # Reject reuse of an operation ID with different input.
                 if existing.get("fingerprint") != fingerprint:
-                    logger.warning(
-                        "Operation fingerprint mismatch | operation_id=%s | user_id=%s",
-                        operation_id,
-                        user_id,
-                    )
-                    return JSONResponse(
-                        status_code=409,
-                        content={
-                            "error": {
-                                "code": "OPERATION_ID_CONFLICT",
-                                "message": (
-                                    "This operation ID was already used "
-                                    "for a different request."
-                                ),
-                            }
-                        },
+                    return error_response(
+                        409,
+                        "OPERATION_ID_CONFLICT",
+                        "This operation ID belongs to a different request.",
                     )
 
                 status = existing.get("status")
 
-                # Case A: The original generation already completed.
+                # -------------------------------------------------
+                # 4A. Replay a completed operation.
+                # -------------------------------------------------
                 if status == "COMPLETED":
-                    chunks_key = f"{operation_key}:chunks"
                     saved_chunks = await redis_client.lrange(
-                        chunks_key, 0, -1
+                        chunks_key,
+                        0,
+                        -1,
                     )
-                    logger.info(
-                        "Replaying completed operation | operation_id=%s | user_id=%s | chunks=%d",
-                        operation_id,
-                        user_id,
-                        len(saved_chunks)
-                    )
+
+                    if not saved_chunks:
+                        return error_response(
+                            409,
+                            "EMPTY_COMPLETED_OPERATION",
+                            "The completed operation has no stored response.",
+                        )
 
                     async def replay_generator():
-                        logger.info(
-                            "streaming replayed chunks | operation_id=%s | user_id=%s | chunks=%d",
-                            operation_id,
-                            user_id,
-                            len(saved_chunks)
-                        )
-                        for chunk in saved_chunks:
-                            yield encode_sse({"text": chunk})
+                        replay_start = time.perf_counter()
 
-                        yield encode_sse({"done": True})
+                        logger.info(
+                            "Redis replay started | operation_id=%s | "
+                            "stored_chunks=%d",
+                            operation_id,
+                            len(saved_chunks),
+                        )
+
+                        try:
+                            first_event = True
+
+                            for event in replay_batches(saved_chunks):
+                                if first_event:
+                                    logger.info(
+                                        "Redis first replay event | "
+                                        "operation_id=%s | duration=%.4fs",
+                                        operation_id,
+                                        time.perf_counter() - replay_start,
+                                    )
+                                    first_event = False
+
+                                yield event
+
+                            logger.info(
+                                "Redis replay completed | operation_id=%s | "
+                                "duration=%.4fs",
+                                operation_id,
+                                time.perf_counter() - replay_start,
+                            )
+
+                            yield encode_sse({"done": True})
+
+                        except asyncio.CancelledError:
+                            raise
+
+                        except Exception:
+                            logger.exception(
+                                "Redis replay failed | operation_id=%s",
+                                operation_id,
+                            )
+
+                            yield encode_sse({
+                                "error": {
+                                    "code": "REPLAY_FAILED",
+                                    "message": (
+                                        "Could not replay the stored response."
+                                    ),
+                                }
+                            })
 
                     return StreamingResponse(
                         replay_generator(),
                         media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "X-Accel-Buffering": "no",
+                        },
                     )
 
-                # Case B: Another request is generating this operation.
-                # Replay saved chunks, then poll for new chunks.
+                # -------------------------------------------------
+                # 4B. Attach to an operation already generating.
+                # -------------------------------------------------
                 if status == "RUNNING":
-                    chunks_key = f"{operation_key}:chunks"
-                    logger.info(
-                        "sending from redis which is already running | operation_id=%s | user_id=%s",
-                        operation_id,
-                        user_id
-                    )
 
                     async def attach_to_existing_stream():
                         index = 0
+                        attach_start = time.perf_counter()
+
                         logger.info(
-                            "streaming from redis which is already running | operation_id=%s | user_id=%s",
+                            "Attaching to running operation | "
+                            "operation_id=%s",
                             operation_id,
-                            user_id
                         )
 
                         while True:
                             chunks = await redis_client.lrange(
-                                chunks_key, index, -1
+                                chunks_key,
+                                index,
+                                index + POLL_BATCH_SIZE - 1,
                             )
 
-                            for chunk in chunks:
-                                yield encode_sse({"text": chunk})
-                                index += 1
+                            if chunks:
+                                for event in replay_batches(chunks):
+                                    yield event
+
+                                index += len(chunks)
 
                             current_status = await redis_client.hget(
-                                operation_key, "status"
+                                operation_key,
+                                "status",
                             )
 
                             if current_status == "COMPLETED":
-                                yield encode_sse({"done": True})
-                                break
+                                total_chunks = await redis_client.llen(
+                                    chunks_key
+                                )
+
+                                if index >= total_chunks:
+                                    logger.info(
+                                        "Attached stream completed | "
+                                        "operation_id=%s | duration=%.4fs",
+                                        operation_id,
+                                        time.perf_counter() - attach_start,
+                                    )
+
+                                    yield encode_sse({"done": True})
+                                    return
+
+                                continue
 
                             if current_status == "FAILED":
-                                yield encode_sse(
-                                    {
-                                        "error": {
-                                            "code": "OPERATION_FAILED",
-                                            "message": (
-                                                "The generation failed retry for th response."
-                                            ),
-                                        }
-                                    }
+                                total_chunks = await redis_client.llen(
+                                    chunks_key
                                 )
-                                break
 
-                            await asyncio.sleep(0.25)
+                                if index < total_chunks:
+                                    continue
 
-                      
+                                yield encode_sse({
+                                    "error": {
+                                        "code": "OPERATION_FAILED",
+                                        "message": (
+                                            "The original generation failed."
+                                        ),
+                                    }
+                                })
+                                return
+
+                            if current_status != "RUNNING":
+                                yield encode_sse({
+                                    "error": {
+                                        "code": "OPERATION_STATE_UNKNOWN",
+                                        "message": (
+                                            "The operation is no longer "
+                                            "in a recognized state."
+                                        ),
+                                    }
+                                })
+                                return
+
+                            await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
                     return StreamingResponse(
                         attach_to_existing_stream(),
                         media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "X-Accel-Buffering": "no",
+                        },
                     )
 
-                # Case C: The previous generation failed.
-                # Atomically reset it so only one request can retry.
+                # -------------------------------------------------
+                # 4C. Retry a previously failed operation.
+                # -------------------------------------------------
                 if status == "FAILED":
                     retry_claimed = await retry_failed_operation(
                         operation_id=operation_id,
                         user_id=user_id,
                     )
-                    logger.info(
-                        "Retry failed operation attempt | operation_id=%s | user_id=%s | retry_claimed=%s",
-                        operation_id, 
-                        user_id,
-                        retry_claimed
-                    )
 
                     if not retry_claimed:
-                        return JSONResponse(
-                            status_code=409,
-                            content={
-                                "error": {
-                                    "code": "RETRY_CONFLICT",
-                                    "message": (
-                                        "The operation state changed. "
-                                        "Retry the request."
-                                    ),
-                                }
-                            },
+                        return error_response(
+                            409,
+                            "RETRY_CONFLICT",
+                            "The failed operation cannot be restarted "
+                            "safely. Use a new operation ID.",
                         )
 
-                    # Continue below into LLM generation.
-                    # redis_available remains True, so new chunks
-                    # will be saved in Redis.
+                    logger.info(
+                        "Failed operation reset to RUNNING | "
+                        "operation_id=%s",
+                        operation_id,
+                    )
 
                 else:
-                    return JSONResponse(
-                        status_code=409,
-                        content={
-                            "error": {
-                                "code": "OPERATION_STATE_UNKNOWN",
-                                "message": (
-                                    "The existing operation has an "
-                                    "unexpected state."
-                                ),
-                            }
-                        },
+                    return error_response(
+                        409,
+                        "OPERATION_STATE_UNKNOWN",
+                        "The operation has an unexpected state.",
                     )
 
         except Exception:
-            logger.exception("Redis operation setup failed")
-
-            # Do not silently generate again if this request may have
-            # already claimed or reset an operation. Doing so could
-            # create a duplicate generation.
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": {
-                        "code": "OPERATION_STORE_UNAVAILABLE",
-                        "message": (
-                            "Could not safely determine the operation state. "
-                            "Retry using the same operation ID."
-                        ),
-                    }
-                },
+            logger.exception(
+                "Could not safely inspect or claim operation | "
+                "operation_id=%s",
+                operation_id,
             )
 
-    # Step 3: Start the LLM generation.
-    provider = get_llm_registry().get_provider(userMessage.provider)
-    llm = llmservice(provider)
+            return error_response(
+                503,
+                "OPERATION_STORE_UNAVAILABLE",
+                "Could not safely determine the operation state. "
+                "Retry using the same operation ID.",
+            )
 
-    stream_start = time.perf_counter()
-
-    logger.info(
-        "LLM streaming started | provider=%s | model=%s",
-        userMessage.provider,
-        userMessage.model,
-    )
-
-    stream = llm.generate(
-        prompt=userMessage.prompt,
-        messages=messages,
-        model=userMessage.model,
-    )
-
-    iterator = stream.__aiter__()
-
-    # Handle failures before the first chunk.
+    # ---------------------------------------------------------
+    # 5. Initialize the LLM stream.
+    #
+    # Do not call iterator.__anext__() here.
+    # We must not wait for Groq's first chunk before returning
+    # StreamingResponse.
+    # ---------------------------------------------------------
     try:
-        first_chunk = await iterator.__anext__()
-
-    except StopAsyncIteration:
-        if redis_available:
-            try:
-                await complete_operation(operation_id, user_id)
-            except Exception:
-                logger.exception("Could not mark empty operation completed")
-
-        async def empty_generator():
-            yield encode_sse({"done": True})
-
-        return StreamingResponse(
-            empty_generator(),
-            media_type="text/event-stream",
+        provider = get_llm_registry().get_provider(
+            userMessage.provider
         )
 
+        llm = llmservice(provider)
+
+        stream_start = time.perf_counter()
+
+        logger.info(
+            "LLM streaming initialized | operation_id=%s | "
+            "provider=%s | model=%s",
+            operation_id,
+            userMessage.provider,
+            userMessage.model,
+        )
+
+        stream = llm.generate(
+            prompt=userMessage.prompt,
+            messages=messages,
+            model=userMessage.model,
+        )
+
+        iterator = stream.__aiter__()
+
     except Exception as exc:
-        logger.exception("LLM failed before first chunk")
+        logger.exception(
+            "Could not initialize LLM stream | operation_id=%s",
+            operation_id,
+        )
 
         if redis_available:
             try:
-                _, safe_message = get_safe_error_message(exc)
-                await fail_operation(
-                    operation_id,
-                    user_id,
-                    safe_message,
-                )
+                await persist_failure(operation_id, user_id, exc)
             except Exception:
-                logger.exception("Could not persist operation failure")
+                logger.exception(
+                    "Could not persist initialization failure | "
+                    "operation_id=%s",
+                    operation_id,
+                )
 
         status_code, message = get_safe_error_message(exc)
 
-        return JSONResponse(
-            status_code=status_code,
-            content={
-                "error": {
-                    "code": status_code,
-                    "message": message,
-                }
-            },
+        return error_response(
+            status_code,
+            "LLM_INITIALIZATION_FAILED",
+            message,
         )
 
-    # Step 4: Persist each chunk before sending it to the client.
+    # ---------------------------------------------------------
+    # 6. Stream immediately and persist non-empty text in batches.
+    # ---------------------------------------------------------
     async def event_generator():
         chunk_count = 0
+        non_empty_text_seen = False
+        pending_chunks: list[str] = []
 
         try:
-            raw_chunks = _prepend_first_chunk(first_chunk, iterator)
+            logger.info(
+                "SSE stream started | operation_id=%s | "
+                "initialization_duration=%.4fs",
+                operation_id,
+                time.perf_counter() - stream_start,
+            )
 
-            async for raw_chunk in raw_chunks:
+            # This event is yielded before waiting for Groq output.
+            yield encode_sse({"status": "started"})
+
+            async for raw_chunk in iterator:
                 chunk = get_chunk_text(raw_chunk)
+                chunk_count += 1
 
-                if redis_available:
-                    await append_chunk(
+                # Record the first provider event, including empty events.
+                if chunk_count == 1:
+                    logger.info(
+                        "First provider chunk received | "
+                        "operation_id=%s | content_empty=%s | "
+                        "duration=%.4fs",
                         operation_id,
-                        user_id,
-                        chunk,
+                        not bool(chunk),
+                        time.perf_counter() - stream_start,
                     )
 
-                chunk_count += 1
+                if chunk:
+                    non_empty_text_seen = True
+
+                    if redis_available:
+                        pending_chunks.append(chunk)
+
+                # Forward every chunk, including empty text.
+                # Do not wait for the first non-empty chunk.
                 yield encode_sse({"text": chunk})
 
+                # Persist after yielding the event to the ASGI server.
+                if (
+                    redis_available
+                    and len(pending_chunks) >= REDIS_WRITE_BATCH_SIZE
+                ):
+                    await append_chunks(
+                        operation_id,
+                        user_id,
+                        pending_chunks,
+                    )
+
+                    pending_chunks.clear()
+
+            # The provider stream ended. An empty response is not success.
+            if not non_empty_text_seen:
+                exc = RuntimeError(
+                    "The provider completed without returning text."
+                )
+
+                if redis_available:
+                    await persist_failure(
+                        operation_id,
+                        user_id,
+                        exc,
+                    )
+
+                yield encode_sse({
+                    "error": {
+                        "code": "EMPTY_LLM_RESPONSE",
+                        "message": (
+                            "The provider completed without returning text."
+                        ),
+                    }
+                })
+                return
+
+            # Flush the final partial batch before marking completion.
+            if redis_available and pending_chunks:
+                await append_chunks(
+                    operation_id,
+                    user_id,
+                    pending_chunks,
+                )
+
+                pending_chunks.clear()
+
             if redis_available:
-                await complete_operation(operation_id, user_id)
+                await complete_operation(
+                    operation_id,
+                    user_id,
+                )
 
             logger.info(
-                "Streaming completed | chunks=%d | duration=%.2fs | total=%.2fs",
+                "Streaming completed | operation_id=%s | "
+                "chunks=%d | duration=%.2fs",
+                operation_id,
                 chunk_count,
-                time.perf_counter() - stream_start,
                 time.perf_counter() - request_start,
             )
 
             yield encode_sse({"done": True})
 
-        except Exception as exc:
-            logger.exception("Streaming or persistence failed")
+        except asyncio.CancelledError:
+            logger.info(
+                "Client stream cancelled | operation_id=%s",
+                operation_id,
+            )
 
             if redis_available:
                 try:
-                    _, safe_message = get_safe_error_message(exc)
-                    await fail_operation(
+                    await persist_failure(
                         operation_id,
                         user_id,
-                        safe_message,
+                        RuntimeError(
+                            "The streaming request was cancelled."
+                        ),
                     )
                 except Exception:
-                    logger.exception("Could not persist operation failure")
+                    logger.exception(
+                        "Failed to persist cancellation | "
+                        "operation_id=%s",
+                        operation_id,
+                    )
+
+            raise
+
+        except Exception as exc:
+            logger.exception(
+                "Streaming or Redis persistence failed | "
+                "operation_id=%s | chunks=%d",
+                operation_id,
+                chunk_count,
+            )
+
+            if redis_available:
+                try:
+                    await persist_failure(
+                        operation_id,
+                        user_id,
+                        exc,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist operation failure | "
+                        "operation_id=%s",
+                        operation_id,
+                    )
 
             _, safe_message = get_safe_error_message(exc)
 
-            yield encode_sse(
-                {
-                    "error": {
-                        "message": safe_message,
-                    }
+            yield encode_sse({
+                "error": {
+                    "code": "STREAMING_FAILED",
+                    "message": safe_message,
                 }
-            )
+            })
+
+        finally:
+            # Release the provider iterator when the client disconnects
+            # or the generator exits.
+            close = getattr(iterator, "aclose", None)
+
+            if close is not None:
+                try:
+                    await close()
+                except Exception:
+                    logger.debug(
+                        "Provider iterator cleanup failed | "
+                        "operation_id=%s",
+                        operation_id,
+                        exc_info=True,
+                    )
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
-
-
-async def _prepend_first_chunk(first_chunk, iterator):
-    """Yield the already-read first chunk, followed by the remaining stream."""
-    yield first_chunk
-
-    async for chunk in iterator:
-        yield chunk

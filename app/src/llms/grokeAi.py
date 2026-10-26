@@ -1,125 +1,194 @@
-import os
 
-from langchain.messages import HumanMessage,AIMessage,SystemMessage
-import logging
 import asyncio
+import logging
+import time
+
 import httpx
 from groq import APIConnectionError, APITimeoutError, APIStatusError
-from langchain_core.messages import BaseMessage
-from app.src.llms.circuit_breakers.groqbreaker import (
-    groq_circuit_breaker,
-    CircuitBreakerOpenError,
-)
-from app.src.llms.llm import LLMContract
+from langchain.messages import HumanMessage
 from langchain_core.messages import BaseMessage
 from langchain_groq import ChatGroq
-from app.src.util.utilservice import calculate_backoff
+
 from app.src.core.config import settings
+from app.src.llms.circuit_breakers.groqbreaker import (
+    groq_circuit_breaker,
+)
+from app.src.llms.llm import LLMContract
+from app.src.util.utilservice import calculate_backoff
+
 logger = logging.getLogger(__name__)
 
+FIRST_CONTENT_TIMEOUT_SECONDS = 30.0
+CHUNK_IDLE_TIMEOUT_SECONDS = 10.0
+MAX_ATTEMPTS = 3
+
+RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
+
+
+class FirstContentTimeoutError(TimeoutError):
+    """No non-empty LLM content arrived within the allowed time."""
+
+
+class ChunkIdleTimeoutError(TimeoutError):
+    """No subsequent LLM chunk arrived within the allowed time."""
 
 
 class GroqProvider(LLMContract):
- 
 
-  # Inside your llmservice class:
-    
-    
-  async def generate(
-      self,
-      prompt: str,
-      messages: list[BaseMessage] = None,
-      model: str = None,
-  ):
-      current_messages = list(messages) if messages is not None else []
+    async def generate(
+        self,
+        prompt: str,
+        messages: list[BaseMessage] | None = None,
+        model: str | None = None,
+    ):
+        current_messages = list(messages) if messages is not None else []
 
-      if prompt:
-          current_messages.append(HumanMessage(content=prompt))
+        if prompt:
+            current_messages.append(HumanMessage(content=prompt))
 
-      # Check the breaker once for the entire generation operation.
-      permit = await groq_circuit_breaker.before_request()
+        permit = await groq_circuit_breaker.before_request()
+        first_content_received = False
 
-      max_attempts = 3
-      first_content_received = False
+        try:
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                llm = ChatGroq(
+                    model=model,
+                    temperature=0.0,
+                    groq_api_key=settings.grokAPIKey,
+                    timeout=FIRST_CONTENT_TIMEOUT_SECONDS,
+                    streaming=True,
+                    max_retries=0,
+                )
 
-      try:
-          for attempt in range(1, max_attempts + 1):
-              llm = ChatGroq(
-                  model=model,
-                  temperature=0.0,
-                  groq_api_key=settings.grokAPIKey,
-                  timeout=10.0,
-                  streaming=True,
-                  max_retries=0,
-              )
+                stream_start = time.perf_counter()
+                raw_chunk_logged = False
+                iterator = llm.astream(current_messages).__aiter__()
 
-              try:
-                    
-                    
-                 
-        
-                
-                  async for chunk in llm.astream(current_messages):
-                      if chunk.content:
-                          first_content_received = True
-                          yield chunk.content
+                try:
+                    while True:
+                        timeout_seconds = (
+                            FIRST_CONTENT_TIMEOUT_SECONDS
+                            if not first_content_received
+                            else CHUNK_IDLE_TIMEOUT_SECONDS
+                        )
 
-                  # Reached only after the stream finishes successfully.
-                  await groq_circuit_breaker.record_success(permit)
-                  return
+                        try:
+                            chunk = await asyncio.wait_for(
+                                iterator.__anext__(),
+                                timeout=timeout_seconds,
+                            )
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError as exc:
+                            if not first_content_received:
+                                raise FirstContentTimeoutError(
+                                    "Timed out waiting for first non-empty "
+                                    "LLM content."
+                                ) from exc
 
-              except (
-                  APIConnectionError,
-                  APITimeoutError,
-                  httpx.TimeoutException,
-              ) as exc:
-                  if first_content_received or attempt == max_attempts:
-                      raise
+                            raise ChunkIdleTimeoutError(
+                                "Timed out waiting for the next LLM chunk."
+                            ) from exc
 
-                  logger.warning(
-                      "Groq connection/timeout failure; retrying "
-                      "(%d/%d). Error type: %s",
-                      attempt,
-                      max_attempts,
-                      type(exc).__name__,
-                  )
+                        elapsed = time.perf_counter() - stream_start
+                        content = chunk.content
 
-                  await asyncio.sleep(calculate_backoff(attempt))
+                        if not raw_chunk_logged:
+                            raw_chunk_logged = True
+                            logger.info(
+                                "Groq first raw chunk | model=%s | "
+                                "duration=%.2fs | content_empty=%s",
+                                model,
+                                elapsed,
+                                not bool(content),
+                            )
 
-              except APIStatusError as exc:
-                  retryable = exc.status_code in (429, 500, 502, 503, 504)
+                        if not content:
+                            continue
 
-                  if not retryable or first_content_received:
-                      raise
+                        if not first_content_received:
+                            first_content_received = True
+                            logger.info(
+                                "Groq first non-empty content | "
+                                "model=%s | duration=%.2fs",
+                                model,
+                                elapsed,
+                            )
 
-                  if attempt == max_attempts:
-                      raise
+                        yield content
 
-                  logger.warning(
-                      "Groq HTTP %d; retrying (%d/%d)",
-                      exc.status_code,
-                      attempt,
-                      max_attempts,
-                  )
+                    await groq_circuit_breaker.record_success(permit)
+                    return
 
-                  await asyncio.sleep(calculate_backoff(attempt))
+                except (
+                    APIConnectionError,
+                    APITimeoutError,
+                    httpx.TimeoutException,
+                    FirstContentTimeoutError,
+                ) as exc:
+                    if first_content_received or attempt == MAX_ATTEMPTS:
+                        raise
 
-      except asyncio.CancelledError:
-          # A disconnected client is not automatically a Groq failure.
-          await groq_circuit_breaker.abandon(permit)
-          raise
+                    logger.warning(
+                        "Groq connection/first-content timeout; "
+                        "retrying (%d/%d). error_type=%s",
+                        attempt,
+                        MAX_ATTEMPTS,
+                        type(exc).__name__,
+                    )
 
-      except Exception as exc:
-          # Count only failures that indicate provider unavailability.
-          is_provider_failure = isinstance(
-              exc,
-              (APIConnectionError, APITimeoutError, httpx.TimeoutException),
-          ) or (
-              isinstance(exc, APIStatusError)
-              and exc.status_code in (500, 502, 503, 504)
-          )
+                    await asyncio.sleep(calculate_backoff(attempt))
 
-          if is_provider_failure:
-              await groq_circuit_breaker.record_failure(permit)
+                except APIStatusError as exc:
+                    retryable = exc.status_code in RETRYABLE_STATUS_CODES
 
-          raise
+                    if (
+                        not retryable
+                        or first_content_received
+                        or attempt == MAX_ATTEMPTS
+                    ):
+                        raise
+
+                    logger.warning(
+                        "Groq HTTP %d; retrying (%d/%d)",
+                        exc.status_code,
+                        attempt,
+                        MAX_ATTEMPTS,
+                    )
+
+                    await asyncio.sleep(calculate_backoff(attempt))
+
+                finally:
+                    close = getattr(iterator, "aclose", None)
+                    if close is not None:
+                        try:
+                            await close()
+                        except Exception:
+                            logger.debug(
+                                "Error closing Groq stream iterator",
+                                exc_info=True,
+                            )
+
+        except asyncio.CancelledError:
+            await groq_circuit_breaker.abandon(permit)
+            raise
+
+        except Exception as exc:
+            is_provider_failure = isinstance(
+                exc,
+                (
+                    APIConnectionError,
+                    APITimeoutError,
+                    httpx.TimeoutException,
+                    FirstContentTimeoutError,
+                    ChunkIdleTimeoutError,
+                ),
+            ) or (
+                isinstance(exc, APIStatusError)
+                and exc.status_code in RETRYABLE_STATUS_CODES
+            )
+
+            if is_provider_failure:
+                await groq_circuit_breaker.record_failure(permit)
+
+            raise

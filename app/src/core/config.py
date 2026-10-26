@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     REDIS_HOST: str = "127.0.0.1"
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
+        
+    OPERATION_TTL_SECONDS :int
+    RUNNING_TTL_SECONDS :int   
 
 
     grokAPIKey:str
